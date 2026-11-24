@@ -526,8 +526,6 @@ static void cs_session_event(ChiakiEvent *event, void *user)
 			type = CS_EVENT_QUIT;
 			reason = cs_quit_reason(event->quit.reason);
 			text = reason == CS_QUIT_OTHER ? chiaki_quit_reason_string(event->quit.reason) : event->quit.reason_str;
-			CHIAKI_LOGI(&session->log, "Quit event: libchiaki reason=%d (%s), mapped=%d, text=%s", (int)event->quit.reason,
-					chiaki_quit_reason_string(event->quit.reason), reason, text ? text : "");
 			break;
 		default:
 			return;
@@ -597,10 +595,8 @@ JNIEXPORT jlong JNICALL JNI_FCN(sessionStart)(JNIEnv *env, jclass cls, jstring h
 	/* İstenen akış boyutu çözücüyle aynı olmalı: PS4'te en çok 720p (PS4 Pro dışında 1080p yok). */
 	bool ps5_session = ps5 == JNI_TRUE;
 	bool want_1080p = height >= 1080 && ps5_session;
-	/* Kotlin tarafı bağlantı sık koptuysa PS4 için 540 yükseklik ister (StreamProfile); eskiden bu sessizce 720p'ydi. */
-	bool want_540p = !want_1080p && height > 0 && height <= 540;
-	int decoder_width = want_1080p ? 1920 : (want_540p ? 960 : 1280);
-	int decoder_height = want_1080p ? 1080 : (want_540p ? 540 : 720);
+	int decoder_width = want_1080p ? 1920 : 1280;
+	int decoder_height = want_1080p ? 1080 : 720;
 	session->listener = (*env)->NewGlobalRef(env, listener);
 	session->on_event = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, listener), "onEvent", "(IILjava/lang/String;)V");
 	if(!session->listener || !session->on_event)
@@ -632,9 +628,7 @@ JNIEXPORT jlong JNICALL JNI_FCN(sessionStart)(JNIEnv *env, jclass cls, jstring h
 			(jbyte *)info.morning);
 	(*env)->GetByteArrayRegion(env, account_array, 0, CHIAKI_PSN_ACCOUNT_ID_SIZE, (jbyte *)info.psn_account_id);
 	chiaki_connect_video_profile_preset(&info.video_profile,
-			want_1080p ? CHIAKI_VIDEO_RESOLUTION_PRESET_1080p
-			: (want_540p ? CHIAKI_VIDEO_RESOLUTION_PRESET_540p : CHIAKI_VIDEO_RESOLUTION_PRESET_720p),
-			CHIAKI_VIDEO_FPS_PRESET_30);
+			want_1080p ? CHIAKI_VIDEO_RESOLUTION_PRESET_1080p : CHIAKI_VIDEO_RESOLUTION_PRESET_720p, CHIAKI_VIDEO_FPS_PRESET_30);
 	info.video_profile.codec = CHIAKI_CODEC_H264; /* PS4 yalnız H.264 destekler */
 	info.video_profile_auto_downgrade = true;
 	info.enable_keyboard = false;
@@ -646,8 +640,6 @@ JNIEXPORT jlong JNICALL JNI_FCN(sessionStart)(JNIEnv *env, jclass cls, jstring h
 	info.packet_loss_max = 0.05;
 	info.enable_idr_on_fec_failure = true;
 
-	CHIAKI_LOGI(&session->log, "Session profile: %s host=%s %dx%d H.264 30fps",
-			ps5_session ? "PS5" : "PS4", host ? host : "?", decoder_width, decoder_height);
 	ChiakiErrorCode err = chiaki_session_init(&session->session, &info, &session->log);
 	(*env)->ReleaseStringUTFChars(env, host_string, host);
 	if(err != CHIAKI_ERR_SUCCESS)
