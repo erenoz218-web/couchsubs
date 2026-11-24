@@ -543,7 +543,31 @@ class PictureWatchdog {
 }
 
 /**
- * PS5'e (ikinci hesapla) Remote Play bağlantısı kurar; görüntü MediaCodec'le yüzeysiz çözülür, her karenin parlaklık
+ * Konsol türüne göre akış boyutu. PS5 1080p açabilir; PS4'ün 1080p'si yalnız PS4 Pro'dadır ve keşif Pro'yu ayırt etmez,
+ * bu yüzden PS4 varsayılan olarak 720p ile sınırlanır ([allowPs4FullHd] ile açılır). Bağlantı sık koptuysa ([lowered]) PS5
+ * 720p'ye, PS4 540p'ye iner (PS4 zaten 720p'deydi). Yerel taraf ön ayarı yüksekliğe göre seçer: 540, 720 ya da 1080.
+ */
+object StreamProfile {
+    fun size(type: ConsoleType, width: Int, height: Int, lowered: Boolean, allowPs4FullHd: Boolean = false): Pair<Int, Int> {
+        var w = width
+        var h = height
+        if (type == ConsoleType.PS4 && !allowPs4FullHd && h > 720) {
+            w = 1280
+            h = 720
+        }
+        if (lowered) {
+            val floor = if (type == ConsoleType.PS4) 540 else 720
+            if (h > floor) {
+                h = floor
+                w = if (floor == 540) 960 else 1280
+            }
+        }
+        return w to h
+    }
+}
+
+/**
+ * PS4 ya da PS5'e (ikinci hesapla) Remote Play bağlantısı kurar; görüntü MediaCodec'le yüzeysiz çözülür, her karenin parlaklık
  * düzlemi yerel tarafta kopyalanıp [onFrame]'e verilir (kare yalnız çağrı süresince geçerlidir; çözücünün iş
  * parçacığında çağrılır, kısa sürmeli). Ses kapalıdır, kol girdisi gönderilmez. Bağlantı koparsa
  * kendiliğinden yeniden bağlanır; PS5 uyuyorsa uyandırılır, adresi değiştiyse ağda yeniden bulunur. Windows'taki
@@ -559,6 +583,8 @@ class StreamSession(
     private val height: Int = 1080,
     /** PS5 bu hesap için giriş şifresi isterse gönderilecek 4 hane (Ayarlar'da kayıtlıysa). */
     private val loginPasscode: String? = null,
+    /** PS4 Pro'da 1080p'ye izin ver (varsayılan kapalı: PS4 720p ile sınırlı). */
+    private val allowPs4FullHd: Boolean = false,
 ) : FrameSource {
     private companion object {
         const val TAG = "CouchSubsSession"
@@ -666,12 +692,12 @@ class StreamSession(
         // Kayıtlı adreste başka bir PS5 yanıt verirse (aynı evde iki PS5, modem adresleri değiştirmiş; GitHub #425)
         // kayıtlı PS5 adıyla ağda aranır; bulunamazsa eskisi gibi o adrese bağlanılır.
         val atHost = ConsoleDiscovery.discover(console.host, 2000).firstOrNull()
-        val info = if (atHost != null && ConsoleDiscovery.isRegistered(atHost, console.name)) atHost else {
-            if (atHost != null) Log.i(TAG, "PS5 ${console.host} adresinde başka PS5 yanıt verdi (${atHost.name}), ${console.name} aranıyor")
+        val info = if (atHost != null && ConsoleDiscovery.isRegistered(atHost, console.name, console.type)) atHost else {
+            if (atHost != null) Log.i(TAG, "${console.type.label} ${console.host} adresinde başka konsol yanıt verdi (${atHost.name}, ${atHost.type.label}), ${console.name} aranıyor")
             relocate() ?: atHost
         }
         if (search.searched(answered = info != null)) {
-            val text = "PS5 aranıyor: art arda ${search.unanswered}. yanıtsız arama; bu cihaz: ${DeviceDiagnostics.line()}"
+            val text = "${console.type.label} aranıyor: art arda ${search.unanswered}. yanıtsız arama; bu cihaz: ${DeviceDiagnostics.line()}"
             Log.w(TAG, text)
             Backend.breadcrumb(text)
         }
@@ -681,8 +707,8 @@ class StreamSession(
             action == WakePolicy.Action.WAKE -> com.couchsubs.mobile.core.ConnectStep.WAKING
             else -> com.couchsubs.mobile.core.ConnectStep.OPENING
         }
-        Log.i(TAG, if (info == null) "PS5 ${console.host} aramaya yanıt vermedi, yine de bağlanılıyor"
-            else "PS5 ${info.name} ${info.host} " + when {
+        Log.i(TAG, if (info == null) "${console.type.label} ${console.host} aramaya yanıt vermedi, yine de bağlanılıyor"
+            else "${info.type.label} ${info.name} ${info.host} " + when {
                 info.isAwake -> "uyanık"
                 action == WakePolicy.Action.WAKE -> "dinlenmede, uyandırılıyor"
                 else -> "dinlenmede, açılması bekleniyor"
@@ -695,7 +721,7 @@ class StreamSession(
                 } catch (error: Exception) {
                     Log.w(TAG, "wake: ${error.message}")
                 }
-                waitForWake(current, System.currentTimeMillis() + 20_000)
+                waitForWake(current, System.currentTimeMillis() + console.type.wakeTimeoutMs)
             }
             // Kullanıcı PS5'i kapattı: yeniden açılmaz; aralıklı bakılır, PS5 açılınca bağlanılır.
             WakePolicy.Action.WAIT_UNTIL_ON ->
@@ -707,9 +733,9 @@ class StreamSession(
         val now = System.currentTimeMillis()
         if (now < nextRelocate) return null
         nextRelocate = now + RELOCATE_INTERVAL_MS
-        val moved = ConsoleDiscovery.pickMoved(ConsoleDiscovery.discover(null, 3000), console.name)
+        val moved = ConsoleDiscovery.pickMoved(ConsoleDiscovery.discover(null, 3000), console.name, console.type)
         if (moved == null || moved.host == console.host) return null
-        Log.i(TAG, "PS5 yeni adreste: ${console.host} -> ${moved.host}")
+        Log.i(TAG, "${console.type.label} yeni adreste: ${console.host} -> ${moved.host}")
         console = console.withHost(moved.host)
         onConsoleMoved(console)
         return moved
@@ -754,14 +780,13 @@ class StreamSession(
         val listener = NativeSessionListener { type, reason, text -> handle(type, reason, text, current) }
         val c = console
         val swapDecoder = watchdog.swapDecoder
-        if (swapDecoder) Backend.breadcrumb("PS5: önceki oturumda görüntü gelmedi; öbür çözücü türüyle deneniyor")
-        // Bağlantı sık koptuysa 720p (yerel taraf yüksekliğe göre 720p ön ayarını seçer).
-        val low = quality.lowered && height > 720
-        val ptr = NativeBridge.sessionStart(c.host, c.registKey, c.morning, accountId, if (low) 1280 else width,
-            if (low) 720 else height, frames,
-            swapDecoder, listener, outcome)
+        if (swapDecoder) Backend.breadcrumb("${c.type.label}: önceki oturumda görüntü gelmedi; öbür çözücü türüyle deneniyor")
+        // PS4 720p ile sınırlıdır; bağlantı sık koptuysa PS5 720p, PS4 540p (yerel taraf yüksekliğe göre ön ayarı seçer).
+        val (streamWidth, streamHeight) = StreamProfile.size(c.type, width, height, quality.lowered, allowPs4FullHd)
+        val ptr = NativeBridge.sessionStart(c.host, c.type.isPs5, c.registKey, c.morning, accountId, streamWidth, streamHeight,
+            frames, swapDecoder, listener, outcome)
         if (ptr == 0L) {
-            Log.w(TAG, "PS5 oturumu başlatılamadı (${c.host}): ${outcome.errors}")
+            Log.w(TAG, "${c.type.label} oturumu başlatılamadı (${c.host}): ${outcome.errors}")
             scheduleReconnect(current, SessionState.Disconnected(DisconnectKind.OTHER, outcome.errorLines.lastOrNull() ?: "session could not be started"))
             return
         }
@@ -916,8 +941,8 @@ class StreamSession(
     /** Akış sürerken bağlantı koptu: sık oluyorsa sonraki oturumlar 720p açılır. */
     private fun noteDrop() {
         if (!quality.dropped(SystemClock.elapsedRealtime())) return
-        val text = "PS5 bağlantısı ${QualityFallback.WINDOW_MS / 60_000} dk içinde ${QualityFallback.DROPS_TO_LOWER} kez koptu; " +
-            "görüntü 720p'ye düşürülüyor (daha az bant genişliği)"
+        val text = "${console.type.label} bağlantısı ${QualityFallback.WINDOW_MS / 60_000} dk içinde ${QualityFallback.DROPS_TO_LOWER} kez koptu; " +
+            "görüntü ${StreamProfile.size(console.type, width, height, true, allowPs4FullHd).second}p'ye düşürülüyor (daha az bant genişliği)"
         Log.w(TAG, text)
         Backend.breadcrumb(text)
     }

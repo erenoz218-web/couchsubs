@@ -6,7 +6,8 @@ import java.net.Inet4Address
 import java.net.NetworkInterface
 
 /**
- * Ağda bulunan PS5. [runningAppTitleId] ve [runningAppName]: o an çalışan uygulama (keşif yanıtındaki
+ * Ağda bulunan PS4 ya da PS5. [type] ve [systemVersion]: keşif yanıtındaki `host-type` ve `system-version`; eski yerel
+ * kütüphane bunları vermezse [type] PS5 sayılır. [runningAppTitleId] ve [runningAppName]: o an çalışan uygulama (keşif yanıtındaki
  * `running-app-titleid`, `running-app-name`); ana ekranda ya da dinlenme modunda null.
  */
 data class ConsoleInfo(
@@ -15,10 +16,65 @@ data class ConsoleInfo(
     val isAwake: Boolean,
     val runningAppTitleId: String? = null,
     val runningAppName: String? = null,
+    val type: ConsoleType = ConsoleType.PS5,
+    val systemVersion: String? = null,
 )
 
-/** PS5'e kaydedilmiş bu telefonun bağlantı bilgileri (Windows: RegisteredConsole). Şifreli saklanır. */
-class RegisteredConsole(val host: String, val name: String, val registKey: ByteArray, val morning: ByteArray) {
+/** Konsol ailesi. PS4 ve PS5 farklı UDP portlarında yanıt verir, farklı kayıt/oturum protokolü konuşur. */
+enum class ConsoleType(val label: String, val wakeTimeoutMs: Long) {
+    /** PS4 dinlenmeden yaklaşık yarım dakikada açılır. */
+    PS4("PS4", 40_000L),
+    PS5("PS5", 20_000L);
+
+    val isPs5: Boolean get() = this == PS5
+
+    companion object {
+        /** Keşif satırındaki `host-type`; boş ya da bilinmiyorsa (eski yerel kütüphane) PS5. */
+        fun fromWire(text: String?): ConsoleType = if (text?.trim().equals("PS4", ignoreCase = true)) PS4 else PS5
+    }
+}
+
+/**
+ * libchiaki'nin ChiakiTarget değerleri (Remote Play sürümü). PS4_8: yazılım 7.0'dan eski (PSN çevrimiçi kimliğiyle kayıt;
+ * desteklenmez), PS4_9: 7.x, PS4_10: 8.0 ve üstü, PS5_1: PS5.
+ */
+object RemotePlayTarget {
+    const val PS4_8 = 800
+    const val PS4_9 = 900
+    const val PS4_10 = 1000
+    const val PS5_1 = 1000100
+
+    fun defaultFor(type: ConsoleType): Int = if (type.isPs5) PS5_1 else PS4_10
+
+    fun typeOf(target: Int): ConsoleType = if (target >= 1_000_000) ConsoleType.PS5 else ConsoleType.PS4
+
+    /** PS4_8 hesap kimliği yerine çevrimiçi kimlik ister; bu uygulama yalnız hesap kimliğiyle kaydeder. */
+    fun supported(target: Int): Boolean = target != PS4_8
+
+    /** Keşifteki sistem sürümünden ("09040001": ilk iki hane ana sürüm) hedef; okunamazsa en yeni PS4 hedefi. */
+    fun forConsole(type: ConsoleType, systemVersion: String?): Int {
+        if (type.isPs5) return PS5_1
+        val major = systemVersion?.trim()?.take(2)?.toIntOrNull()?.takeIf { it > 0 } ?: return PS4_10
+        return when {
+            major >= 8 -> PS4_10
+            major == 7 -> PS4_9
+            else -> PS4_8
+        }
+    }
+}
+
+/**
+ * PS4 ya da PS5'e kaydedilmiş bu telefonun bağlantı bilgileri (Windows: RegisteredConsole). Şifreli saklanır.
+ * [type] ve [target] saklamaya da yazılmalıdır; yazılmamış (eski) kayıtlar PS5 sayılır.
+ */
+class RegisteredConsole(
+    val host: String,
+    val name: String,
+    val registKey: ByteArray,
+    val morning: ByteArray,
+    val type: ConsoleType = ConsoleType.PS5,
+    val target: Int = RemotePlayTarget.defaultFor(type),
+) {
     /** Uyandırma için kayıt anahtarının onaltılık değeri. */
     val wakeCredential: Long?
         get() {
@@ -31,7 +87,7 @@ class RegisteredConsole(val host: String, val name: String, val registKey: ByteA
             }
         }
 
-    fun withHost(newHost: String) = RegisteredConsole(newHost, name, registKey, morning)
+    fun withHost(newHost: String) = RegisteredConsole(newHost, name, registKey, morning, type, target)
 }
 
 /**
@@ -109,34 +165,53 @@ object Registration {
         return errors.firstOrNull()
     }
 
-    /** PS5'in "Cihazı Bağla" ekranındaki kodla kayıt olur (bloklar, en çok ~30 sn × deneme). */
-    fun register(host: String, accountId: ByteArray, pin: Int): RegisteredConsole {
+    /**
+     * PS5'in "Cihazı Bağla" ya da PS4'ün "Aygıt Ekle" ekranındaki kodla kayıt olur (bloklar, en çok ~30 sn × deneme).
+     * [type] verilmezse konsol önce aramayla tanınır; tanınamazsa her turda önce PS5 sonra PS4 hedefiyle denenir.
+     */
+    fun register(host: String, accountId: ByteArray, pin: Int, type: ConsoleType? = null): RegisteredConsole {
         require(accountId.size == 8) { "PSN account id must be 8 bytes" }
         if (!NativeBridge.available) throw RegistrationException(RegistrationFailure.FAILED, detail = "native library missing")
+        val found = ConsoleDiscovery.discover(host, 2000).firstOrNull()
+        val resolved = type ?: found?.type
+        val targets = when {
+            resolved != null -> listOf(RemotePlayTarget.forConsole(resolved, found?.takeIf { it.type == resolved }?.systemVersion))
+            else -> listOf(RemotePlayTarget.PS5_1, RemotePlayTarget.PS4_10)
+        }
+        targets.firstOrNull { !RemotePlayTarget.supported(it) }?.let {
+            throw RegistrationException(RegistrationFailure.FAILED, detail = "PS4 system software older than 7.0 is not supported")
+        }
         var attempt = 1
         while (true) {
-            val outcome = NativeOutcome()
-            NativeBridge.register(host, accountId, pin, outcome)
-            if (outcome.code == 0) {
-                return RegisteredConsole(host, outcome.nickname ?: "PS5", outcome.registKey!!, outcome.morning!!)
+            var last: RegistrationException? = null
+            for (target in targets) {
+                val outcome = NativeOutcome()
+                NativeBridge.register(host, accountId, pin, target, outcome)
+                if (outcome.code == 0) {
+                    val kind = RemotePlayTarget.typeOf(target)
+                    return RegisteredConsole(host, outcome.nickname ?: kind.label, outcome.registKey!!, outcome.morning!!, kind, target)
+                }
+                val lines = outcome.errorLines
+                val reported = if (outcome.code == 1 && outcome.reason != 0) outcome.reason else null
+                val failure = when (outcome.code) {
+                    1 -> failureFrom(reported, lines)
+                    2 -> RegistrationFailure.NO_REPLY
+                    else -> RegistrationFailure.FAILED
+                }
+                val error = RegistrationException(failure, reported, detailFrom(lines))
+                // Yanıtsız arama dışındaki hatalar yeniden denenmez (başka hedefle de aynı yere çıkar).
+                if (failure != RegistrationFailure.NO_ANSWER) throw error
+                last = error
             }
-            val lines = outcome.errorLines
-            val reported = if (outcome.code == 1 && outcome.reason != 0) outcome.reason else null
-            val failure = when (outcome.code) {
-                1 -> failureFrom(reported, lines)
-                2 -> RegistrationFailure.NO_REPLY
-                else -> RegistrationFailure.FAILED
-            }
-            // Kod PS5'e gitmeden biten arama aşamasında paket kaybı olabilir; yeniden denemek güvenlidir.
-            if (!shouldRetry(failure, attempt))
-                throw RegistrationException(failure, reported, detailFrom(lines))
+            // Kod konsola gitmeden biten arama aşamasında paket kaybı olabilir; yeniden denemek güvenlidir.
+            if (!shouldRetry(RegistrationFailure.NO_ANSWER, attempt)) throw last!!
             attempt++
             Thread.sleep(500)
         }
     }
 }
 
-/** PS5'i ağda arar ve uyandırır (libchiaki'nin arama protokolü). */
+/** PS4 ve PS5'i ağda arar ve uyandırır (libchiaki'nin arama protokolü). */
 object ConsoleDiscovery {
     /** [host] verilirse yalnız ona, yoksa telefonun bulunduğu /24 ağın bütün adreslerine sorar (bloklar). */
     fun discover(host: String?, timeoutMs: Int = 2000): List<ConsoleInfo> {
@@ -148,35 +223,40 @@ object ConsoleDiscovery {
         } ?: emptyList()
     }
 
-    /** "adres\tad\tuyanık(0/1)[\toyun kimliği\toyun adı]" (yerel kütüphanenin yanıt satırı). */
+    /** "adres\tad\tuyanık(0/1)[\toyun kimliği\toyun adı[\tPS4|PS5[\tsistem sürümü]]]" (yerel kütüphanenin yanıt satırı). */
     fun parseLine(line: String): ConsoleInfo? {
         val parts = line.split('\t')
         if (parts.size < 3) return null
-        return ConsoleInfo(parts[0], parts[1], parts[2] == "1", parts.getOrNull(3)?.ifEmpty { null }, parts.getOrNull(4)?.ifEmpty { null })
+        return ConsoleInfo(
+            parts[0], parts[1], parts[2] == "1", parts.getOrNull(3)?.ifEmpty { null }, parts.getOrNull(4)?.ifEmpty { null },
+            ConsoleType.fromWire(parts.getOrNull(5)), parts.getOrNull(6)?.ifEmpty { null },
+        )
     }
 
-    /** PS5'te o an çalışan oyun: yalnız bağlı PS5'in adresine sorulur (bloklar; ortak havuz için). */
+    /** Konsolda o an çalışan oyun: yalnız bağlı konsolun adresine sorulur (bloklar; ortak havuz için). */
     fun runningGame(host: String): RunningGame? =
         discover(host, 2000).firstOrNull()?.let { RunningGame.create(it.runningAppTitleId, it.runningAppName) }
 
     fun wake(console: RegisteredConsole) {
         val credential = console.wakeCredential ?: throw IllegalStateException("Registration key is not a wake credential")
-        NativeBridge.wake(console.host, credential)
+        NativeBridge.wake(console.host, credential, console.type.isPs5)
     }
 
     /**
-     * Adresi değişen kayıtlı PS5: adı (kayıtta PS5'in verdiği ad) tek eşleşen; emin değilse null. Eskiden ağda tek PS5
-     * varsa adına bakılmadan o seçiliyordu; aynı evde iki PS5 varken uygulama diğerine geçiyordu (GitHub #425).
+     * Adresi değişen kayıtlı konsol: adı (kayıtta konsolun verdiği ad) ve türü ([type] verilmişse) tek eşleşen; emin değilse
+     * null. Eskiden ağda tek PS5 varsa adına bakılmadan o seçiliyordu; aynı evde iki PS5 varken uygulama diğerine geçiyordu
+     * (GitHub #425).
      */
-    fun pickMoved(found: List<ConsoleInfo>, name: String): ConsoleInfo? =
-        found.filter { isRegistered(it, name) }.singleOrNull()
+    fun pickMoved(found: List<ConsoleInfo>, name: String, type: ConsoleType? = null): ConsoleInfo? =
+        found.filter { isRegistered(it, name, type) }.singleOrNull()
 
     /**
-     * Aramaya yanıt veren PS5 kayıtlı PS5 mi (ad eşleşmesi, boşluk ve harf büyüklüğü gözetilmez; eskiden harf farkında PS5
-     * yeni adreste bulunamıyordu; kayıtta ad yoksa her yanıt kabul edilir, Windows ve Mac ile aynı).
+     * Aramaya yanıt veren konsol kayıtlı konsol mu (ad eşleşmesi, boşluk ve harf büyüklüğü gözetilmez; kayıtta ad yoksa her
+     * yanıt kabul edilir, Windows ve Mac ile aynı). [type] verilmişse PS4/PS5 türü de aynı olmalıdır: adresi başka türde
+     * bir konsola geçmiş kayıt o konsola bağlanmaya çalışmasın.
      */
-    fun isRegistered(info: ConsoleInfo, name: String): Boolean =
-        name.isBlank() || info.name.trim().equals(name.trim(), ignoreCase = true)
+    fun isRegistered(info: ConsoleInfo, name: String, type: ConsoleType? = null): Boolean =
+        (type == null || info.type == type) && (name.isBlank() || info.name.trim().equals(name.trim(), ignoreCase = true))
 
     /** Telefonun Wi-Fi ya da Ethernet adresinin /24 ağındaki diğer adresler. */
     fun subnetAddresses(): List<String> {
