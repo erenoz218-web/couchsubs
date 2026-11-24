@@ -783,6 +783,7 @@ class StreamSession(
         if (swapDecoder) Backend.breadcrumb("${c.type.label}: önceki oturumda görüntü gelmedi; öbür çözücü türüyle deneniyor")
         // PS4 720p ile sınırlıdır; bağlantı sık koptuysa PS5 720p, PS4 540p (yerel taraf yüksekliğe göre ön ayarı seçer).
         val (streamWidth, streamHeight) = StreamProfile.size(c.type, width, height, quality.lowered, allowPs4FullHd)
+        Log.i(TAG, "${c.type.label} ${c.host}: oturum açılıyor ${streamWidth}x$streamHeight, swapDecoder=$swapDecoder")
         val ptr = NativeBridge.sessionStart(c.host, c.type.isPs5, c.registKey, c.morning, accountId, streamWidth, streamHeight,
             frames, swapDecoder, listener, outcome)
         if (ptr == 0L) {
@@ -855,7 +856,12 @@ class StreamSession(
                             SessionState.Disconnected(DisconnectKind.REJECTED)
                         else SessionState.Disconnected(general, text)
                     val kind = state.kind
-                    Log.i(TAG, "Oturum kapandı: $kind ${state.detail.orEmpty()} $text")
+                    Log.i(TAG, "Oturum kapandı: $kind ${state.detail.orEmpty()} $text (yerel neden $reason)")
+                    // Asıl neden çoğu zaman libchiaki'nin hata satırlarındadır: hangi türde olursa olsun günlüğe yaz.
+                    NativeBridge.sessionErrors(native)?.trim()?.takeIf { it.isNotEmpty() }?.let {
+                        Log.w(TAG, "libchiaki hata satırları: $it")
+                        Backend.breadcrumb("${console.type.label} libchiaki hatası (yerel neden $reason): ${it.take(400)}")
+                    }
                     // Bekçi değil libchiaki kapattı (PS5 ya da ağ); görüntünün son ana kadar gelip gelmediği nedeni ayırır.
                     watchdog.summary(SystemClock.elapsedRealtime())?.let {
                         val note = "PS5 oturumunu libchiaki kapattı ($kind); $it"
