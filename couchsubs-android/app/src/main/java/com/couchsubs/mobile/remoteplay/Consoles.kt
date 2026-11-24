@@ -88,6 +88,10 @@ class RegisteredConsole(
         }
 
     fun withHost(newHost: String) = RegisteredConsole(newHost, name, registKey, morning, type, target)
+
+    /** Konsol türü (ve Remote Play hedefi) düzeltilmiş kopya; PS4'ün PS5 diye kaydedilmiş kaydını onarmak için. */
+    fun withType(newType: ConsoleType, newTarget: Int = RemotePlayTarget.defaultFor(newType)) =
+        RegisteredConsole(host, name, registKey, morning, newType, newTarget)
 }
 
 /**
@@ -173,7 +177,9 @@ object Registration {
         require(accountId.size == 8) { "PSN account id must be 8 bytes" }
         if (!NativeBridge.available) throw RegistrationException(RegistrationFailure.FAILED, detail = "native library missing")
         val found = ConsoleDiscovery.discover(host, 2000).firstOrNull()
-        val resolved = type ?: found?.type
+        // Konsolun kendi yanıtındaki tür (host-type) kesindir ve çağıranın verdiği türden önceliklidir: PS4'ü PS5 hedefiyle
+        // kaydedip PS5 diye saklamak, sonraki oturumun PS5 olarak (1080p) açılıp reddedilmesine yol açıyordu.
+        val resolved = found?.type ?: type
         val targets = when {
             resolved != null -> listOf(RemotePlayTarget.forConsole(resolved, found?.takeIf { it.type == resolved }?.systemVersion))
             else -> listOf(RemotePlayTarget.PS5_1, RemotePlayTarget.PS4_10)
@@ -249,6 +255,17 @@ object ConsoleDiscovery {
      */
     fun pickMoved(found: List<ConsoleInfo>, name: String, type: ConsoleType? = null): ConsoleInfo? =
         found.filter { isRegistered(it, name, type) }.singleOrNull()
+
+    /**
+     * Adreste yanıt veren konsol kayıtlı konsolla aynı adı taşıyor ama türü farklıysa (ör. PS4 yanlışlıkla PS5 diye
+     * kaydedilmiş ya da eski kayıtta tür yok ve varsayılan PS5 sayılmış) kaydı konsolun bildirdiği türe ([ConsoleInfo.type],
+     * keşif yanıtındaki `host-type`) çevirir. Tür ya da ad uyuşmuyorsa kaydı olduğu gibi döndürür.
+     */
+    fun withDiscoveredType(console: RegisteredConsole, found: ConsoleInfo): RegisteredConsole {
+        if (found.type == console.type) return console
+        if (!isRegistered(found, console.name, null)) return console
+        return console.withType(found.type, RemotePlayTarget.forConsole(found.type, found.systemVersion))
+    }
 
     /**
      * Aramaya yanıt veren konsol kayıtlı konsol mu (ad eşleşmesi, boşluk ve harf büyüklüğü gözetilmez; kayıtta ad yoksa her

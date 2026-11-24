@@ -548,10 +548,12 @@ class PictureWatchdog {
  * 720p'ye, PS4 540p'ye iner (PS4 zaten 720p'deydi). Yerel taraf ön ayarı yüksekliğe göre seçer: 540, 720 ya da 1080.
  */
 object StreamProfile {
+    @Suppress("UNUSED_PARAMETER")
     fun size(type: ConsoleType, width: Int, height: Int, lowered: Boolean, allowPs4FullHd: Boolean = false): Pair<Int, Int> {
         var w = width
         var h = height
-        if (type == ConsoleType.PS4 && !allowPs4FullHd && h > 720) {
+        // PS4 her zaman en çok 720p: [allowPs4FullHd] artık dikkate alınmaz (PS4 oturumu 1080p istemesin).
+        if (type == ConsoleType.PS4 && h > 720) {
             w = 1280
             h = 720
         }
@@ -692,6 +694,9 @@ class StreamSession(
         // Kayıtlı adreste başka bir PS5 yanıt verirse (aynı evde iki PS5, modem adresleri değiştirmiş; GitHub #425)
         // kayıtlı PS5 adıyla ağda aranır; bulunamazsa eskisi gibi o adrese bağlanılır.
         val atHost = ConsoleDiscovery.discover(console.host, 2000).firstOrNull()
+        // Adresteki konsol PS4 olduğunu bildiriyorsa kayıt PS5 görünse bile PS4 olarak düzeltilir ve saklanır; oturum PS5
+        // (1080p) değil PS4 (720p) açılır.
+        if (atHost != null) adoptDiscoveredType(atHost)
         val info = if (atHost != null && ConsoleDiscovery.isRegistered(atHost, console.name, console.type)) atHost else {
             if (atHost != null) Log.i(TAG, "${console.type.label} ${console.host} adresinde başka konsol yanıt verdi (${atHost.name}, ${atHost.type.label}), ${console.name} aranıyor")
             relocate() ?: atHost
@@ -727,6 +732,18 @@ class StreamSession(
             WakePolicy.Action.WAIT_UNTIL_ON ->
                 scheduleReconnect(current, SessionState.Disconnected(DisconnectKind.CONSOLE_ASLEEP))
         }
+    }
+
+    /** Konsol aramada türünü farklı bildirdiyse ([ConsoleDiscovery.withDiscoveredType]) kaydı düzeltir ve kalıcı yazdırır. */
+    private fun adoptDiscoveredType(found: ConsoleInfo) {
+        val updated = ConsoleDiscovery.withDiscoveredType(console, found)
+        if (updated === console) return
+        val text = "${console.name}: kayıtlı tür ${console.type.label}, konsol ${found.type.label} bildirdi; " +
+            "${found.type.label} olarak düzeltiliyor (hedef ${console.target} -> ${updated.target})"
+        Log.w(TAG, text)
+        Backend.breadcrumb(text)
+        console = updated
+        onConsoleMoved(updated)
     }
 
     private fun relocate(): ConsoleInfo? {
