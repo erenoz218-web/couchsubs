@@ -41,8 +41,9 @@ ChiakiErrorCode couchsubs_video_decoder_init(CouchSubsVideoDecoder *decoder, Chi
 {
 	memset(decoder, 0, sizeof(*decoder));
 	decoder->log = log;
-	decoder->target_width = width;
-	decoder->target_height = height;
+	/* Geçersiz boyut çözücü kurulumunu bozmasın (SPS gerçek boyutu bildirir). */
+	decoder->target_width = width > 0 ? width : 1280;
+	decoder->target_height = height > 0 ? height : 720;
 	atomic_init(&decoder->shutdown_output, false);
 	atomic_init(&decoder->unsupported_output, false);
 	atomic_init(&decoder->frames_out, 0);
@@ -113,6 +114,11 @@ static bool open_codec(CouchSubsVideoDecoder *decoder, bool software)
 		AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_COLOR_FORMAT, COLOR_FORMAT_YUV420_FLEXIBLE);
 		/* Android 11+: düşük gecikmeli çözme (desteklemeyen cihaz yok sayar). */
 		AMediaFormat_setInt32(format, "low-latency", 1);
+		/* PS4 akışının SPS'inde çoğunlukla "max_num_reorder_frames" yoktur: bazı donanım çözücüler (Qualcomm,
+		 * MediaTek) kare tamponunu doldurmadan çıkış vermez (siyah ekran/gecikme). Gerçek zamanlı öncelik ve
+		 * satıcıya özgü düşük gecikme anahtarları istenir; bilmeyen çözücü bunları yok sayar. */
+		AMediaFormat_setInt32(format, "priority", 0);
+		AMediaFormat_setInt32(format, "vendor.qti-ext-dec-low-latency.enable", 1);
 		media_status_t r = AMediaCodec_configure(decoder->codec, format, NULL, NULL, 0);
 		AMediaFormat_delete(format);
 		if(r != AMEDIA_OK)

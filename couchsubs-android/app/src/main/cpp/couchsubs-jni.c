@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
-/* Kotlin'deki com.couchsubs.mobile.remoteplay.NativeBridge'in yerel tarafı: libchiaki ile PS5 arama, uyandırma,
+/* Kotlin'deki com.couchsubs.mobile.remoteplay.NativeBridge'in yerel tarafı: libchiaki ile PS4/PS5 arama, uyandırma,
  * kayıt ve görüntü akışı. Davranış Windows'taki windows/native/couchsubs_native.c ile aynıdır (1080p30 H.264,
  * ses kapalı, kol girdisi yok); çözme FFmpeg yerine Android MediaCodec'le yüzeysiz yapılır, karenin parlaklık düzlemi
  * kare dinleyicisine verilir (video-decoder.c).
@@ -19,6 +19,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -156,14 +157,18 @@ typedef struct {
 static void cs_discovery_cb(ChiakiDiscoveryHost *host, void *user)
 {
 	cs_discover_ctx *ctx = user;
-	if(!host || !host->host_addr || !chiaki_discovery_host_is_ps5(host))
+	if(!host || !host->host_addr)
 		return;
+	bool is_ps5 = chiaki_discovery_host_is_ps5(host);
 	/* Sona PS5'te çalışan uygulamanın kimliği ve adı eklenir (yoksa boş): ortak havuz satırı oyunla gider. */
-	char line[512];
-	snprintf(line, sizeof(line), "%s\t%s\t%d\t%s\t%s", host->host_addr, host->host_name ? host->host_name : "PS5",
+	char line[640];
+	snprintf(line, sizeof(line), "%s\t%s\t%d\t%s\t%s\t%s\t%s", host->host_addr,
+			host->host_name ? host->host_name : (is_ps5 ? "PS5" : "PS4"),
 			host->state == CHIAKI_DISCOVERY_HOST_STATE_READY ? 1 : 0,
 			host->running_app_titleid ? host->running_app_titleid : "",
-			host->running_app_name ? host->running_app_name : "");
+			host->running_app_name ? host->running_app_name : "",
+			is_ps5 ? "PS5" : "PS4",
+			host->system_version ? host->system_version : "");
 	for(char *c = line; *c; c++)
 		if(*c == '\n' || *c == '\r') *c = ' ';
 	for(char *c = line; *c; c++)
@@ -189,7 +194,7 @@ static void cs_sleep_ms(unsigned int ms)
 	nanosleep(&ts, NULL);
 }
 
-/* Verilen adreslere PS5 araması gönderir; yanıtlar "adres\tad\tuyanık(0/1)" dizeleri. Süre dolana kadar bloklar. */
+/* Verilen adreslere PS4 ve PS5 araması gönderir; yanıtlar "adres\tad\tuyanık\toyunId\toyunAdı\tPS4|PS5\tsistemSürümü" dizeleri. Süre dolana kadar bloklar. */
 JNIEXPORT jobjectArray JNICALL JNI_FCN(discover)(JNIEnv *env, jclass cls, jobjectArray targets, jint timeout_ms)
 {
 	(void)cls;
@@ -215,7 +220,8 @@ JNIEXPORT jobjectArray JNICALL JNI_FCN(discover)(JNIEnv *env, jclass cls, jobjec
 		return NULL;
 	}
 
-	struct sockaddr_in *addresses = calloc((size_t)target_count, sizeof(struct sockaddr_in));
+	/* Her hedef için iki kayıt: [2k] PS4 portu, [2k+1] PS5 portu. */
+	struct sockaddr_in *addresses = calloc((size_t)target_count * 2, sizeof(struct sockaddr_in));
 	int address_count = 0;
 	for(jsize i = 0; addresses && i < target_count; i++)
 	{
@@ -223,26 +229,38 @@ JNIEXPORT jobjectArray JNICALL JNI_FCN(discover)(JNIEnv *env, jclass cls, jobjec
 		if(!target)
 			continue;
 		const char *text = (*env)->GetStringUTFChars(env, target, NULL);
-		struct sockaddr_in *address = &addresses[address_count];
-		address->sin_family = AF_INET;
-		address->sin_port = htons(CHIAKI_DISCOVERY_PORT_PS5);
-		if(inet_pton(AF_INET, text, &address->sin_addr) == 1)
-			address_count++;
-		(*env)->ReleaseStringUTFChars(env, target, text);
+		if(text)
+		{
+			struct sockaddr_in *ps4_addr = &addresses[address_count];
+			struct sockaddr_in *ps5_addr = &addresses[address_count + 1];
+			ps4_addr->sin_family = AF_INET;
+			ps4_addr->sin_port = htons(CHIAKI_DISCOVERY_PORT_PS4);
+			if(inet_pton(AF_INET, text, &ps4_addr->sin_addr) == 1)
+			{
+				*ps5_addr = *ps4_addr;
+				ps5_addr->sin_port = htons(CHIAKI_DISCOVERY_PORT_PS5);
+				address_count += 2;
+			}
+			(*env)->ReleaseStringUTFChars(env, target, text);
+		}
 		(*env)->DeleteLocalRef(env, target);
 	}
 
-	char version[] = CHIAKI_DISCOVERY_PROTOCOL_VERSION_PS5;
+	char version_ps4[] = CHIAKI_DISCOVERY_PROTOCOL_VERSION_PS4;
+	char version_ps5[] = CHIAKI_DISCOVERY_PROTOCOL_VERSION_PS5;
 	ChiakiDiscoveryPacket packet;
 	memset(&packet, 0, sizeof(packet));
 	packet.cmd = CHIAKI_DISCOVERY_CMD_SRCH;
-	packet.protocol_version = version;
 	/* Yanıt kaçmasın diye arama süre dolana kadar yinelenir. */
 	uint64_t end = chiaki_time_now_monotonic_ms() + (uint64_t)(timeout_ms > 0 ? timeout_ms : 0);
 	do
 	{
 		for(int i = 0; i < address_count; i++)
+		{
+			/* Çift indeks PS4 (UDP 987), tek indeks PS5 (UDP 9302) paketi alır. */
+			packet.protocol_version = (i % 2 == 0) ? version_ps4 : version_ps5;
 			chiaki_discovery_send(&discovery, &packet, (struct sockaddr *)&addresses[i], sizeof(struct sockaddr_in));
+		}
 		cs_sleep_ms(500);
 	} while(chiaki_time_now_monotonic_ms() < end);
 
@@ -262,13 +280,15 @@ JNIEXPORT jobjectArray JNICALL JNI_FCN(discover)(JNIEnv *env, jclass cls, jobjec
 	return result;
 }
 
-JNIEXPORT jint JNICALL JNI_FCN(wake)(JNIEnv *env, jclass cls, jstring host_string, jlong credential)
+JNIEXPORT jint JNICALL JNI_FCN(wake)(JNIEnv *env, jclass cls, jstring host_string, jlong credential, jboolean ps5)
 {
 	(void)cls;
+	if(!host_string)
+		return (jint)CHIAKI_ERR_INVALID_DATA;
 	ChiakiLog log;
 	chiaki_log_init(&log, CHIAKI_LOG_ERROR, cs_sink_cb, NULL);
 	const char *host = (*env)->GetStringUTFChars(env, host_string, NULL);
-	ChiakiErrorCode err = chiaki_discovery_wakeup(&log, NULL, host, (uint64_t)credential, true);
+	ChiakiErrorCode err = chiaki_discovery_wakeup(&log, NULL, host, (uint64_t)credential, ps5 == JNI_TRUE);
 	(*env)->ReleaseStringUTFChars(env, host_string, host);
 	return err == CHIAKI_ERR_SUCCESS ? 0 : (int)err;
 }
@@ -329,14 +349,31 @@ static jbyteArray byte_array(JNIEnv *env, const void *data, size_t size)
 /* PS5'in "Cihazı Bağla" kodu ile kayıt (bloklar, en çok ~30 sn). Sonuç outcome'a yazılır:
  * code 0 başarı, 1 PS5 reddetti ya da hata (reason, errors), 2 yanıt yok (zaman aşımı), -1 başlatılamadı. */
 JNIEXPORT void JNICALL JNI_FCN(register)(JNIEnv *env, jclass cls, jstring host_string, jbyteArray account_array,
-		jint pin, jobject outcome)
+		jint pin, jint target, jobject outcome)
 {
 	(void)cls;
 	int result = -1;
+	if(!outcome)
+		return;
 	if(!host_string || !account_array || (*env)->GetArrayLength(env, account_array) != CHIAKI_PSN_ACCOUNT_ID_SIZE)
 	{
 		set_int(env, outcome, "code", result);
 		return;
+	}
+	/* PS4_8 (800) yalnız PSN çevrimiçi kimliğiyle kaydolur; hesap kimliği kullanan PS4_9/PS4_10 ve PS5 desteklenir. */
+	ChiakiTarget chiaki_target;
+	switch(target)
+	{
+		case CHIAKI_TARGET_PS4_9:
+		case CHIAKI_TARGET_PS4_10:
+		case CHIAKI_TARGET_PS5_1:
+			chiaki_target = (ChiakiTarget)target;
+			break;
+		default:
+			__android_log_print(ANDROID_LOG_ERROR, TAG, "Unsupported register target: %d", (int)target);
+			set_object(env, outcome, "errors", "Ljava/lang/String;", (*env)->NewStringUTF(env, "Unsupported register target"));
+			set_int(env, outcome, "code", result);
+			return;
 	}
 	cs_log_sink sink;
 	cs_sink_init(&sink);
@@ -349,20 +386,31 @@ JNIEXPORT void JNICALL JNI_FCN(register)(JNIEnv *env, jclass cls, jstring host_s
 	chiaki_cond_init(&ctx.cond);
 
 	const char *host = (*env)->GetStringUTFChars(env, host_string, NULL);
+	if(!host)
+	{
+		chiaki_cond_fini(&ctx.cond);
+		chiaki_mutex_fini(&ctx.mutex);
+		cs_sink_fini(&sink);
+		set_int(env, outcome, "code", result);
+		return;
+	}
 	ChiakiRegistInfo info;
 	memset(&info, 0, sizeof(info));
-	info.target = CHIAKI_TARGET_PS5_1;
+	info.target = chiaki_target;
 	info.host = host;
 	info.broadcast = false;
 	info.psn_online_id = NULL;
 	(*env)->GetByteArrayRegion(env, account_array, 0, CHIAKI_PSN_ACCOUNT_ID_SIZE, (jbyte *)info.psn_account_id);
-	info.pin = (uint32_t)pin;
+	info.pin = (uint32_t)pin; /* PS4: 8 haneli, PS5: 8 haneli kod */
 	info.console_pin = 0;
 	info.holepunch_info = NULL;
 	info.rudp = NULL;
 
 	ChiakiRegist regist;
+	memset(&regist, 0, sizeof(regist));
 	ChiakiErrorCode err = chiaki_regist_start(&regist, &log, &info, cs_regist_event, &ctx);
+	if(err != CHIAKI_ERR_SUCCESS)
+		CHIAKI_LOGE(&log, "Regist start failed: %s", chiaki_error_string(err));
 	if(err == CHIAKI_ERR_SUCCESS)
 	{
 		chiaki_mutex_lock(&ctx.mutex);
@@ -384,7 +432,8 @@ JNIEXPORT void JNICALL JNI_FCN(register)(JNIEnv *env, jclass cls, jstring host_s
 			nickname[sizeof(ctx.host.server_nickname)] = '\0';
 			for(char *c = nickname; *c; c++)
 				if(*c & 0x80) *c = '?';
-			set_object(env, outcome, "nickname", "Ljava/lang/String;", (*env)->NewStringUTF(env, nickname));
+			jstring nickname_java = (*env)->NewStringUTF(env, nickname);
+			set_object(env, outcome, "nickname", "Ljava/lang/String;", nickname_java);
 			set_object(env, outcome, "registKey", "[B", byte_array(env, ctx.host.rp_regist_key, sizeof(ctx.host.rp_regist_key)));
 			set_object(env, outcome, "morning", "[B", byte_array(env, ctx.host.rp_key, sizeof(ctx.host.rp_key)));
 			result = 0;
@@ -504,14 +553,14 @@ static void cs_session_event(ChiakiEvent *event, void *user)
 		(*global_vm)->DetachCurrentThread(global_vm);
 }
 
-/* PS5 "bu görüntü yayınlanamaz" (korumalı içerik, rp_prohibit) ya da "yeniden yayınlanabilir" dediğinde libchiaki'nin
+/* PS4/PS5 "bu görüntü yayınlanamaz" (korumalı içerik, rp_prohibit) ya da "yeniden yayınlanabilir" dediğinde libchiaki'nin
  * ctrl iş parçacığı bu geri çağrıyı koşulsuz çağırır (ctrl.c: displaya/displayb iletileri ve ctrl yanıtı). Atanmazsa
  * NULL işlev çağrılır ve uygulama SIGSEGV ile kapanır (Crashlytics: ctrl_thread_func, ctrl.c:995/1005). Altyazı için
  * yapılacak bir şey yok: yalnız günlüğe yazılır, akış sürer. */
 static void cs_session_cant_display(void *user, bool cant_display)
 {
 	cs_session *session = user;
-	CHIAKI_LOGI(&session->log, "PS5 stream %s", cant_display ? "can't display (protected content)" : "can display again");
+	CHIAKI_LOGI(&session->log, "Console stream %s", cant_display ? "can't display (protected content)" : "can display again");
 }
 
 static void cs_session_free(JNIEnv *env, cs_session *session)
@@ -526,20 +575,39 @@ static void cs_session_free(JNIEnv *env, cs_session *session)
 /* Oturumu başlatır; 0 dönerse lastError'a nedeni yazar. listener.onEvent(type, reason, text) libchiaki'nin iş
  * parçacığından çağrılır. Kareler frameListener.onFrame(buffer, width, height, rowStride, colorFormat) ile çözücünün
  * çıkış iş parçacığından verilir (arabellek yalnız çağrı süresince geçerlidir). */
-JNIEXPORT jlong JNICALL JNI_FCN(sessionStart)(JNIEnv *env, jclass cls, jstring host_string, jbyteArray regist_key_array,
-		jbyteArray morning_array, jbyteArray account_array, jint width, jint height, jobject frame_listener, jboolean swap_decoder,
-		jobject listener, jobject outcome)
+JNIEXPORT jlong JNICALL JNI_FCN(sessionStart)(JNIEnv *env, jclass cls, jstring host_string, jboolean ps5,
+		jbyteArray regist_key_array, jbyteArray morning_array, jbyteArray account_array, jint width, jint height,
+		jobject frame_listener, jboolean swap_decoder, jobject listener, jobject outcome)
 {
 	(void)cls;
+	if(!host_string || !regist_key_array || !morning_array || !account_array || !frame_listener || !listener || !outcome
+			|| (*env)->GetArrayLength(env, account_array) < CHIAKI_PSN_ACCOUNT_ID_SIZE)
+	{
+		if(outcome)
+			set_object(env, outcome, "errors", "Ljava/lang/String;", (*env)->NewStringUTF(env, "Invalid session arguments"));
+		return 0;
+	}
 	cs_session *session = calloc(1, sizeof(cs_session));
 	if(!session)
 		return 0;
 	cs_sink_init(&session->sink);
 	chiaki_log_init(&session->log, LOG_MASK, cs_sink_cb, &session->sink);
+	/* İstenen akış boyutu çözücüyle aynı olmalı: PS4'te en çok 720p (PS4 Pro dışında 1080p yok). */
+	bool ps5_session = ps5 == JNI_TRUE;
+	bool want_1080p = height >= 1080 && ps5_session;
+	int decoder_width = want_1080p ? 1920 : 1280;
+	int decoder_height = want_1080p ? 1080 : 720;
 	session->listener = (*env)->NewGlobalRef(env, listener);
 	session->on_event = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, listener), "onEvent", "(IILjava/lang/String;)V");
+	if(!session->listener || !session->on_event)
+	{
+		(*env)->ExceptionClear(env);
+		set_object(env, outcome, "errors", "Ljava/lang/String;", (*env)->NewStringUTF(env, "Session listener is invalid"));
+		cs_session_free(env, session);
+		return 0;
+	}
 
-	if(couchsubs_video_decoder_init(&session->decoder, &session->log, width, height) != CHIAKI_ERR_SUCCESS
+	if(couchsubs_video_decoder_init(&session->decoder, &session->log, decoder_width, decoder_height) != CHIAKI_ERR_SUCCESS
 			|| !couchsubs_video_decoder_start(&session->decoder, env, frame_listener, swap_decoder == JNI_TRUE))
 	{
 		set_object(env, outcome, "errors", "Ljava/lang/String;", (*env)->NewStringUTF(env, "H.264 decoder could not be opened"));
@@ -549,7 +617,7 @@ JNIEXPORT jlong JNICALL JNI_FCN(sessionStart)(JNIEnv *env, jclass cls, jstring h
 
 	ChiakiConnectInfo info;
 	memset(&info, 0, sizeof(info));
-	info.ps5 = true;
+	info.ps5 = ps5_session;
 	const char *host = (*env)->GetStringUTFChars(env, host_string, NULL);
 	info.host = host; /* libchiaki adresi oturum açılırken kopyalar */
 	jsize key_size = (*env)->GetArrayLength(env, regist_key_array);
@@ -560,8 +628,8 @@ JNIEXPORT jlong JNICALL JNI_FCN(sessionStart)(JNIEnv *env, jclass cls, jstring h
 			(jbyte *)info.morning);
 	(*env)->GetByteArrayRegion(env, account_array, 0, CHIAKI_PSN_ACCOUNT_ID_SIZE, (jbyte *)info.psn_account_id);
 	chiaki_connect_video_profile_preset(&info.video_profile,
-			height >= 1080 ? CHIAKI_VIDEO_RESOLUTION_PRESET_1080p : CHIAKI_VIDEO_RESOLUTION_PRESET_720p, CHIAKI_VIDEO_FPS_PRESET_30);
-	info.video_profile.codec = CHIAKI_CODEC_H264;
+			want_1080p ? CHIAKI_VIDEO_RESOLUTION_PRESET_1080p : CHIAKI_VIDEO_RESOLUTION_PRESET_720p, CHIAKI_VIDEO_FPS_PRESET_30);
+	info.video_profile.codec = CHIAKI_CODEC_H264; /* PS4 yalnız H.264 destekler */
 	info.video_profile_auto_downgrade = true;
 	info.enable_keyboard = false;
 	info.enable_dualsense = false;
